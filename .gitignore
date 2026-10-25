@@ -1,0 +1,9 @@
+/bin/
+*.exe
+*.test
+*.out
+.env
+web/node_modules/
+web/dist/
+scenarios/*.jsonl
+*.7z
