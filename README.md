@@ -60,7 +60,7 @@ web/             панель управления (React)
 
 ## Запуск
 
-Нужны Go 1.23+ и Docker.
+Нужны Go 1.26+ и Docker.
 
 ```bash
 docker compose up -d postgres   # PostgreSQL, схема из migrations/ применяется при первом старте
@@ -71,7 +71,7 @@ go run ./cmd/server             # http://localhost:8080/healthz
 Без локального Go тесты можно запустить в контейнере:
 
 ```bash
-docker run --rm -v "$PWD":/src -w /src golang:1.23 go test ./...
+docker run --rm -v "$PWD":/src -w /src golang:1.26 go test ./...
 ```
 
 ## Стек
