@@ -9,3 +9,4 @@ scenarios/*.jsonl
 *.7z
 /.vscode
 task
+lcl/
