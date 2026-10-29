@@ -28,6 +28,11 @@ type Config struct {
 	// Sleep ждёт d. По умолчанию — реальное ожидание; в экспериментах
 	// подменяется сдвигом виртуальных часов.
 	Sleep func(ctx context.Context, d time.Duration) error
+
+	// Drift — изменение ErrorRate во времени; если задан, ErrorRate не используется.
+	// Start — точка отсчёта, по умолчанию время создания канала по его часам.
+	Drift []DriftPoint
+	Start time.Time
 }
 
 func (c Config) validate() error {
@@ -42,7 +47,7 @@ func (c Config) validate() error {
 	if c.Latency < 0 || c.Jitter < 0 {
 		return fmt.Errorf("simulator %s: отрицательная задержка", c.ID)
 	}
-	return nil
+	return validateDrift(c)
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -57,7 +62,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 // Channel — имитатор платёжного канала. Исход попытки детерминирован:
-// он зависит только от seed, канала и ключа попытки.
+// он зависит только от seed, канала, ключа попытки и времени по часам канала.
 type Channel struct {
 	cfg    Config
 	ledger Ledger
@@ -76,6 +81,9 @@ func New(cfg Config, ledger Ledger, clk clock.Clock) (*Channel, error) {
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleep
 	}
+	if cfg.Start.IsZero() {
+		cfg.Start = clk.Now()
+	}
 	return &Channel{cfg: cfg, ledger: ledger, clock: clk, declined: make(map[string]bool)}, nil
 }
 
@@ -85,6 +93,10 @@ func (c *Channel) Tariff() channel.Tariff { return c.cfg.Tariff }
 
 // Latency — типичная задержка ответа канала.
 func (c *Channel) Latency() time.Duration { return c.cfg.Latency + c.cfg.Jitter/2 }
+
+// ErrorRateAt — истинная доля технических ошибок в момент t. Стратегиям
+// недоступна; нужна эксперименту для сравнения с «оракулом».
+func (c *Channel) ErrorRateAt(t time.Time) float64 { return c.cfg.errorRateAt(t) }
 
 func (c *Channel) Charge(ctx context.Context, key string, amount int64, _ string) (channel.ChargeResult, error) {
 	res, err := c.process(ctx, key, amount)
@@ -112,6 +124,7 @@ func (c *Channel) process(ctx context.Context, key string, amount int64) (channe
 	}
 
 	r := c.roll(key, "outcome")
+	errRate := c.cfg.errorRateAt(c.clock.Now())
 	switch {
 	case r < c.cfg.TimeoutRate:
 		if c.roll(key, "timeout") < c.cfg.TimeoutChargeRate {
@@ -120,9 +133,9 @@ func (c *Channel) process(ctx context.Context, key string, amount int64) (channe
 			}
 		}
 		return channel.ChargeResult{Outcome: channel.Unknown, Reason: "timeout"}, nil
-	case r < c.cfg.TimeoutRate+c.cfg.ErrorRate:
+	case r < c.cfg.TimeoutRate+errRate:
 		return channel.ChargeResult{Outcome: channel.ChannelError, Reason: "provider error"}, nil
-	case r < c.cfg.TimeoutRate+c.cfg.ErrorRate+c.cfg.DeclineRate:
+	case r < c.cfg.TimeoutRate+errRate+c.cfg.DeclineRate:
 		c.mu.Lock()
 		c.declined[key] = true
 		c.mu.Unlock()
