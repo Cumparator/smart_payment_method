@@ -2,16 +2,30 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
+
+	"github.com/Cumparator/smart_payment_method/internal/config"
 )
 
 func main() {
-	addr := os.Getenv("SPM_ADDR")
-	if addr == "" {
-		addr = ":8080"
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("config", "err", err)
+		os.Exit(1)
 	}
+
+	level := slog.LevelInfo
+	switch cfg.LogLevel {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -21,6 +35,9 @@ func main() {
 	// GET /channels, POST /channels/{id}/outage, POST /experiments.
 	// TODO: запуск воркеров, сверщика и уборщика зависших STARTED.
 
-	log.Printf("listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	slog.Info("listening", "addr", cfg.Addr)
+	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
+		slog.Error("server", "err", err)
+		os.Exit(1)
+	}
 }
