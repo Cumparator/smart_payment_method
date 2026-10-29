@@ -162,3 +162,50 @@ func TestCancel(t *testing.T) {
 		t.Fatalf("итог %+v", s)
 	}
 }
+
+func TestLatency(t *testing.T) {
+	ctx := context.Background()
+	var waited []time.Duration
+	ch := newTestChannel(t, Config{
+		Latency: 100 * time.Millisecond,
+		Jitter:  50 * time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			waited = append(waited, d)
+			return nil
+		},
+	})
+
+	for i := range 100 {
+		ch.Charge(ctx, fmt.Sprintf("p%d:1", i), 100, "RUB")
+	}
+	for _, d := range waited {
+		if d < 100*time.Millisecond || d > 150*time.Millisecond {
+			t.Fatalf("задержка %s вне 100..150ms", d)
+		}
+	}
+	if len(waited) != 100 {
+		t.Fatalf("ожиданий %d", len(waited))
+	}
+	if ch.Latency() != 125*time.Millisecond {
+		t.Fatalf("типичная задержка %s", ch.Latency())
+	}
+}
+
+func TestClientGaveUp(t *testing.T) {
+	ch := newTestChannel(t, Config{Latency: time.Hour})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	res, err := ch.Charge(ctx, "p1:1", 100, "RUB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != channel.Unknown {
+		t.Fatalf("исход %s", res.Outcome)
+	}
+	// списание прошло, хоть клиент и не дождался ответа
+	st, _ := ch.Status(context.Background(), "p1:1")
+	if st.Outcome != channel.StatusApproved {
+		t.Fatalf("статус %s", st.Outcome)
+	}
+}
