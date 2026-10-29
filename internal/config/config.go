@@ -4,7 +4,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"strconv"
 )
 
 // Config — настройки сервиса.
@@ -35,12 +34,4 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func atoi(s string, def int) int {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return def
-	}
-	return n
 }
