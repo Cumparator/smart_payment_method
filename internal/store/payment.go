@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/Cumparator/smart_payment_method/internal/payment"
+	"github.com/jackc/pgx/v5"
 )
 
 // PaymentRow — строка payments.

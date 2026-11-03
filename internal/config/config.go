@@ -36,11 +36,3 @@ func getenv(key, def string) string {
 	}
 	return def
 }
-
-func atoi(s string, def int) int {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return def
-	}
-	return n
-}
