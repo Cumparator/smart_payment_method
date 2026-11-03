@@ -1,6 +1,3 @@
--- Seed: 4 платёжных канала с разными характеристиками.
--- config хранит параметры имитатора: success_rate, error_rate, rps_limit, schedule.
-
 INSERT INTO channels (id, name, is_enabled, cost_per_tx, avg_latency_ms, config) VALUES
   ('ch_cheap_slow', 'Дешёвый медленный', TRUE, 0.30, 1200,
    '{"success_rate":0.86,"error_rate":0.06,"rps_limit":50,"schedule":"24x7","tariff":{"fixed":3,"percent":0.002}}'),
