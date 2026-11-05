@@ -7,6 +7,28 @@ on:
 jobs:
   go:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+
+        env:
+          POSTGRES_USER: spm
+          POSTGRES_PASSWORD: spm
+          POSTGRES_DB: spm
+
+        ports:
+          - 5432:5432
+
+        options: >-
+          --health-cmd "pg_isready -U spm -d spm"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      SPM_DATABASE_URL: postgres://spm:spm@localhost:5432/spm?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +53,9 @@ jobs:
 
       - name: Staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: Run migrations
+        run: go run ./cmd/migrate up
 
       - name: Test
         run: go test -race ./...
