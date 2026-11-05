@@ -7,4 +7,6 @@ web/node_modules/
 web/dist/
 scenarios/*.jsonl
 *.7z
+/.vscode
+task
 lcl/
