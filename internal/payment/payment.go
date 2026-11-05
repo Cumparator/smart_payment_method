@@ -29,6 +29,29 @@ const (
 	AttemptCancelled    AttemptState = "CANCELLED"
 )
 
+// IsLive — попытка не завершена: канал ещё может списать деньги.
+// UNKNOWN тоже «живая»: исход неизвестен, пока его не выяснит сверщик.
+// Список состояний должен совпадать с частичным индексом attempts_one_live_idx.
+func (s AttemptState) IsLive() bool {
+	return s == AttemptStarted || s == AttemptUnknown
+}
+
+// attemptTransitions — допустимые переходы состояния попытки.
+var attemptTransitions = map[AttemptState][]AttemptState{
+	AttemptStarted: {AttemptApproved, AttemptDeclined, AttemptChannelError, AttemptUnknown, AttemptCancelled},
+	AttemptUnknown: {AttemptApproved, AttemptDeclined, AttemptCancelled},
+}
+
+// ValidateAttemptTransition проверяет переход попытки до CAS-обновления в БД.
+func ValidateAttemptTransition(from, to AttemptState) error {
+	for _, s := range attemptTransitions[from] {
+		if s == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("payment: недопустимый переход попытки %s → %s", from, to)
+}
+
 // MaxAttempts — не более 3 попыток на платёж.
 const MaxAttempts = 3
 
@@ -41,6 +64,9 @@ type Attempt struct {
 	StartedAt  time.Time
 	FinishedAt *time.Time
 }
+
+// IsLive — см. AttemptState.IsLive.
+func (a Attempt) IsLive() bool { return a.State.IsLive() }
 
 // ChannelKey — ключ идемпотентности попытки, передаваемый в канал.
 func (a Attempt) ChannelKey() string {
