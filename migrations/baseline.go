@@ -265,8 +265,8 @@ func Baseline(ctx context.Context, db *sql.DB) error {
         VALUES
             (0, TRUE),
             (1, TRUE),
-            (2, TRUE)
-    `)
+            ($1, TRUE)
+    `, legacyVersion)
 	if err != nil {
 		return fmt.Errorf("baseline: register versions: %w", err)
 	}

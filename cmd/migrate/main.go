@@ -25,8 +25,7 @@ up-by-one   Применить одну миграцию
 down        Откатить последнюю миграцию
 status      Показать состояние миграций
 version     Показать текущую версию БД
-baseline    Зарегистрировать существующую старую схему
-`
+baseline    Зарегистрировать существующую старую схему`
 
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
@@ -83,7 +82,6 @@ func run(ctx context.Context, args []string) error {
 	defer provider.Close()
 
 	switch command {
-
 	case "up":
 		results, err := provider.Up(ctx)
 		if err != nil {
