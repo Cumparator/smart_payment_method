@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Cumparator/smart_payment_method/internal/channel"
+	"github.com/Cumparator/smart_payment_method/internal/strategy"
 )
 
 // latencyAlpha — вес нового замера в сглаженной задержке.
@@ -82,4 +83,17 @@ func (r *Registry) Snapshot(channelID string) Snapshot {
 		snap.Load = min(1, float64(s.inflight)/float64(s.maxInflight))
 	}
 	return snap
+}
+
+// Candidate собирает кандидата для стратегий из снимка канала и его тарифа.
+func (r *Registry) Candidate(channelID string, tariff channel.Tariff) strategy.Candidate {
+	snap := r.Snapshot(channelID)
+	return strategy.Candidate{
+		ChannelID: channelID,
+		Tariff:    tariff,
+		Successes: snap.Successes,
+		Attempts:  snap.Attempts,
+		LatencyS:  snap.LatencyS,
+		Load:      snap.Load,
+	}
 }

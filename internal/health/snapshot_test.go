@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Cumparator/smart_payment_method/internal/channel"
+	"github.com/Cumparator/smart_payment_method/internal/strategy"
 )
 
 func TestLatencyDefaultThenSmoothed(t *testing.T) {
@@ -68,5 +69,66 @@ func TestNoLimitNoLoad(t *testing.T) {
 	r.Begin("A")
 	if got := r.Snapshot("A").Load; got != 0 {
 		t.Fatalf("без лимита загрузка %.2f", got)
+	}
+}
+
+func TestCandidate(t *testing.T) {
+	r := New(10)
+	r.Register("A", 300*time.Millisecond, 10)
+	r.Record("A", channel.Approved, 400*time.Millisecond)
+	r.Record("A", channel.ChannelError, 400*time.Millisecond)
+
+	tariff := channel.Tariff{Fixed: 5, Percent: 0.01}
+	c := r.Candidate("A", tariff)
+	if c.ChannelID != "A" || c.Tariff != tariff || c.Successes != 1 || c.Attempts != 2 {
+		t.Fatalf("кандидат %+v", c)
+	}
+	if math.Abs(c.LatencyS-0.4) > 1e-9 {
+		t.Fatalf("задержка %.3f", c.LatencyS)
+	}
+}
+
+func TestCandidateSuccessProbability(t *testing.T) {
+	r := New(10)
+	for range 3 {
+		r.Record("A", channel.Approved, time.Second)
+	}
+	r.Record("A", channel.ChannelError, time.Second)
+	r.Record("A", channel.Declined, time.Second) // бизнес-отказ в статистику не входит
+
+	// 3 успеха из 4 технических исходов, сглаживание Лапласа: (3+1)/(4+2)
+	if got := r.Candidate("A", channel.Tariff{}).PSuccess(); math.Abs(got-4.0/6) > 1e-9 {
+		t.Fatalf("p_success %.4f, ожидалось %.4f", got, 4.0/6)
+	}
+	// у канала без статистики вероятность нейтральная
+	if got := r.Candidate("B", channel.Tariff{}).PSuccess(); got != 0.5 {
+		t.Fatalf("p_success без статистики %.2f, ожидалось 0.5", got)
+	}
+}
+
+// Снимки из реестра — то, что получают стратегии: ненадёжный дешёвый канал
+// проигрывает надёжному дорогому у ExpectedCost, но не у Cheapest.
+func TestCandidatesFeedStrategies(t *testing.T) {
+	r := New(100)
+	r.Register("cheap", 500*time.Millisecond, 0)
+	r.Register("solid", 500*time.Millisecond, 0)
+	for range 19 {
+		r.Record("cheap", channel.ChannelError, 500*time.Millisecond)
+	}
+	r.Record("cheap", channel.Approved, 500*time.Millisecond)
+	for range 20 {
+		r.Record("solid", channel.Approved, 500*time.Millisecond)
+	}
+	cands := []strategy.Candidate{
+		r.Candidate("cheap", channel.Tariff{Percent: 0.010}),
+		r.Candidate("solid", channel.Tariff{Percent: 0.015}),
+	}
+
+	if got := strategy.Rank(strategy.Cheapest{}, 100_000, cands)[0].ChannelID; got != "cheap" {
+		t.Fatalf("cheapest выбрал %s, ожидался cheap", got)
+	}
+	ec := strategy.ExpectedCost{FailurePenalty: 5_000, SecondCost: 50, LoadThreshold: 0.7, LoadPenalty: 1_000}
+	if got := strategy.Rank(ec, 100_000, cands)[0].ChannelID; got != "solid" {
+		t.Fatalf("expected_cost выбрал %s, ожидался solid", got)
 	}
 }
