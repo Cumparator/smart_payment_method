@@ -17,6 +17,12 @@ type observation struct {
 type channelStats struct {
 	successes int
 	attempts  int
+
+	latencyS        float64 // сглаженная задержка ответа, секунды
+	hasLatency      bool
+	defaultLatencyS float64 // пока замеров нет
+	inflight        int
+	maxInflight     int // 0 — лимит не задан
 }
 
 // Registry — статистика каналов по скользящему окну последних технических
@@ -61,12 +67,16 @@ func (r *Registry) stats(id string) *channelStats {
 
 // Observe добавляет исход попытки в окно.
 func (r *Registry) Observe(channelID string, o channel.ChargeOutcome) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.observeLocked(channelID, o)
+}
+
+func (r *Registry) observeLocked(channelID string, o channel.ChargeOutcome) {
 	counted, success := technical(o)
 	if !counted {
 		return
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.filled == len(r.ring) {
 		old := r.ring[r.head]
