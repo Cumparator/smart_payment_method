@@ -32,6 +32,8 @@ func newFakeStore() *fakeStore {
 }
 
 func (f *fakeStore) add(id string, amount int64, at time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.pays[id] = &payment.Payment{ID: id, Amount: amount, Currency: "RUB", State: payment.Received, NextRunAt: at}
 }
 
@@ -145,12 +147,15 @@ type fakeChannel struct {
 }
 
 func (c *fakeChannel) ID() string { return c.id }
-func (c *fakeChannel) Charge(_ context.Context, key string, _ int64, _ string) (channel.ChargeResult, error) {
+func (c *fakeChannel) Charge(ctx context.Context, key string, _ int64, _ string) (channel.ChargeResult, error) {
 	c.mu.Lock()
 	c.keys = append(c.keys, key)
 	c.mu.Unlock()
 	if c.onCharge != nil {
 		c.onCharge(key)
+	}
+	if err := ctx.Err(); err != nil { // как имитатор: оборванный вызов — UNKNOWN
+		return channel.ChargeResult{Outcome: channel.Unknown, Reason: err.Error()}, nil
 	}
 	if c.err != nil {
 		return channel.ChargeResult{}, c.err
@@ -430,5 +435,106 @@ func TestParallelWorkersDoNotShareAPayment(t *testing.T) {
 		if p := f.st.pay(fmt.Sprintf("p%d", i)); p.State != payment.Succeeded {
 			t.Fatalf("p%d: state = %s", i, p.State)
 		}
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("не дождались: %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRunProcessesQueueAndStops(t *testing.T) {
+	f := newFixture(t, &fakeChannel{id: "cheap"}, &fakeChannel{id: "mid"}, &fakeChannel{id: "fast"})
+	f.w.cfg.Workers = 4
+	f.w.cfg.IdleWait = time.Millisecond
+	const n = 50
+	for i := 0; i < n; i++ {
+		f.st.add(fmt.Sprintf("p%d", i), 10000, f.clk.Now())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		f.w.Run(ctx)
+		close(done)
+	}()
+
+	waitFor(t, "все платежи обработаны", func() bool {
+		for i := 0; i < n; i++ {
+			if f.st.pay(fmt.Sprintf("p%d", i)).State != payment.Succeeded {
+				return false
+			}
+		}
+		return true
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не остановился после отмены контекста")
+	}
+}
+
+// Остановка: новые платежи не берутся, а взятые доводятся до конца,
+// причём вызов канала не обрывается отменой контекста.
+func TestRunGracefulStop(t *testing.T) {
+	gate := make(chan struct{})
+	started := make(chan struct{}, 8)
+	cheap := &fakeChannel{id: "cheap", onCharge: func(string) {
+		started <- struct{}{}
+		<-gate
+	}}
+	f := newFixture(t, cheap, &fakeChannel{id: "mid"}, &fakeChannel{id: "fast"})
+	f.w.cfg.Workers = 3
+	f.w.cfg.IdleWait = time.Millisecond
+	for _, id := range []string{"p1", "p2", "p3"} {
+		f.st.add(id, 10000, f.clk.Now())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		f.w.Run(ctx)
+		close(done)
+	}()
+	for i := 0; i < 3; i++ { // все три воркера внутри вызова канала
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("воркеры не начали вызовы канала")
+		}
+	}
+
+	cancel()
+	f.st.add("late", 10000, f.clk.Now()) // появился уже после остановки
+	select {
+	case <-done:
+		t.Fatal("Run вернулся, пока вызовы канала ещё в полёте")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(gate)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run не остановился после завершения вызовов")
+	}
+
+	for _, id := range []string{"p1", "p2", "p3"} {
+		if p := f.st.pay(id); p.State != payment.Succeeded {
+			t.Errorf("%s: state = %s, want SUCCEEDED (вызов не должен обрываться при остановке)", id, p.State)
+		}
+		if a := f.st.att(id); len(a) != 1 || a[0].State != payment.AttemptApproved {
+			t.Errorf("%s: attempts = %+v", id, a)
+		}
+	}
+	if p := f.st.pay("late"); p.State != payment.Received {
+		t.Errorf("late: state = %s, want RECEIVED (после остановки платежи не берутся)", p.State)
 	}
 }

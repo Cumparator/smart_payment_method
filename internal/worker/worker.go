@@ -90,7 +90,9 @@ func New(st Store, rt Router, channels []channel.PaymentChannel, clk clock.Clock
 	}
 }
 
-// Run запускает cfg.Workers циклов и ждёт их завершения после отмены ctx.
+// Run запускает cfg.Workers циклов. После отмены ctx воркеры не берут новые платежи,
+// но доводят до конца те, что уже взяты (включая вызов канала), и только потом
+// Run возвращается. Дольше всего ждать приходится ChargeTimeout.
 func (w *Worker) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for i := 0; i < w.cfg.Workers; i++ {
@@ -122,6 +124,11 @@ func (w *Worker) loop(ctx context.Context) {
 }
 
 // ProcessOne обрабатывает один платёж из очереди. false — очередь пуста.
+//
+// ctx управляет только захватом платежа. Взятый платёж обрабатывается до конца
+// независимо от отмены ctx: оборвать вызов канала на середине значило бы получить
+// UNKNOWN и ненужную сверку, хотя канал мог спокойно ответить. Время вызова
+// ограничено ChargeTimeout.
 func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 	p, ok, err := w.store.ClaimPayment(ctx, w.clock.Now())
 	if err != nil {
@@ -130,7 +137,7 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	return true, w.process(ctx, p)
+	return true, w.process(context.WithoutCancel(ctx), p)
 }
 
 func (w *Worker) process(ctx context.Context, p payment.Payment) error {
