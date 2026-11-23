@@ -1,223 +1,136 @@
-// Package router filters unavailable payment channels and ranks the remaining
-// candidates with the configured strategy.
 package router
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"strings"
-	"time"
 
-	"github.com/Cumparator/smart_payment_method/internal/channel"
 	"github.com/Cumparator/smart_payment_method/internal/clock"
 	"github.com/Cumparator/smart_payment_method/internal/payment"
 	"github.com/Cumparator/smart_payment_method/internal/store"
+
 	"github.com/Cumparator/smart_payment_method/internal/strategy"
 )
 
-var ErrNilRepository = errors.New("router: repository is nil")
+// ErrNoChannel — не осталось каналов, в которые можно отправить платёж.
+var ErrNoChannel = errors.New("router: нет доступных каналов")
 
-// Repository is the subset of storage operations required by the router.
-type Repository interface {
-	ListChannels(context.Context) ([]store.ChannelRecord, error)
-	GetLiveAttempt(context.Context, string) (payment.Attempt, bool, error)
-	ListAttempts(context.Context, string) ([]payment.Attempt, error)
-}
-
-// channelConfig is stored in channels.config (JSONB). Amount values are in kopecks.
-type channelConfig struct {
-	MinAmount *int64         `json:"min_amount,omitempty"`
-	MaxAmount *int64         `json:"max_amount,omitempty"`
-	Schedule  string         `json:"schedule,omitempty"`
-	Tariff    channel.Tariff `json:"tariff"`
-}
-
-// ExclusionReason describes why a channel did not reach the ranking stage.
-type ExclusionReason string
-
-const (
-	ReasonDisabled           ExclusionReason = "disabled"
-	ReasonBelowMinAmount     ExclusionReason = "below_min_amount"
-	ReasonAboveMaxAmount     ExclusionReason = "above_max_amount"
-	ReasonOutsideSchedule    ExclusionReason = "outside_schedule_utc"
-	ReasonPreviousChannelErr ExclusionReason = "previous_channel_error"
-)
-
-// Exclusion is an explanation for a filtered channel.
-type Exclusion struct {
-	ChannelID string
-	Reason    ExclusionReason
-}
-
-// Decision contains ranked candidates and a trace of filters applied.
-// If LiveAttempt is non-nil, no new routing decision may be made for this payment.
+// Decision — выбранный канал и объяснение выбора (пишется в routing_decisions).
 type Decision struct {
+	ChannelID   string
 	Strategy    string
+	Details     json.RawMessage
 	Ranked      []strategy.Scored
 	Excluded    []Exclusion
 	LiveAttempt *payment.Attempt
 }
 
-// Router selects channels. The initial implementation uses neutral statistics:
-// zero successes/attempts (Laplace-smoothed probability 0.5), zero load, and the
-// configured average latency. A future health snapshot can replace these defaults.
+// Source отдаёт снимок каналов, допущенных к выбору (включённых, с живым breaker).
+type Source interface {
+	Candidates(ctx context.Context) ([]strategy.Candidate, error)
+}
+
+// StaticSource — фиксированный список кандидатов для тестов и экспериментов.
+type StaticSource []strategy.Candidate
+
+func (s StaticSource) Candidates(context.Context) ([]strategy.Candidate, error) {
+	return append([]strategy.Candidate(nil), s...), nil
+}
+
+// Router выбирает канал в два этапа: фильтрация, затем оценка стратегией.
 type Router struct {
+	strategy strategy.Strategy
+	source   Source
 	repo     Repository
 	clock    clock.Clock
-	strategy strategy.Strategy
 }
 
-// New creates a router. A nil clock defaults to real time; a nil strategy defaults
-// to Cheapest. The repository is required and is checked when Select is called.
-func New(repo Repository, clk clock.Clock, strat strategy.Strategy) *Router {
-	if clk == nil {
-		clk = clock.Real{}
-	}
-	if strat == nil {
-		strat = strategy.Cheapest{}
-	}
-	return &Router{repo: repo, clock: clk, strategy: strat}
+func New(s strategy.Strategy, src Source) *Router {
+	return &Router{strategy: s, source: src}
 }
 
-// Select filters channels for the payment and ranks the remaining candidates.
-// STARTED/UNKNOWN attempts stop routing entirely. CHANNEL_ERROR excludes only
-// the channel that produced it; DECLINED does not exclude a channel.
-func (r *Router) Select(ctx context.Context, p payment.Payment) (Decision, error) {
-	if r == nil || r.repo == nil {
-		return Decision{}, ErrNilRepository
-	}
+type scoredInfo struct {
+	ChannelID string  `json:"channel_id"`
+	Score     float64 `json:"score"`
+	PSuccess  float64 `json:"p_success"`
+	Fee       float64 `json:"fee"`
+}
 
-	decision := Decision{Strategy: r.strategy.Name()}
+type excludedInfo struct {
+	ChannelID string `json:"channel_id"`
+	Reason    string `json:"reason"`
+}
 
-	live, found, err := r.repo.GetLiveAttempt(ctx, p.ID)
+type details struct {
+	Amount     int64          `json:"amount"`
+	Chosen     string         `json:"chosen"`
+	Candidates []scoredInfo   `json:"candidates"`
+	Excluded   []excludedInfo `json:"excluded,omitempty"`
+}
+
+// Choose исключает каналы из exclude (уже пробовавшиеся для этого платежа),
+// оценивает остальных стратегией и берёт лучшего.
+func (r *Router) Choose(ctx context.Context, amount int64, exclude []string) (Decision, error) {
+	all, err := r.source.Candidates(ctx)
 	if err != nil {
-		return Decision{}, fmt.Errorf("get live attempt: %w", err)
+		return Decision{}, err
 	}
-	if found {
-		decision.LiveAttempt = &live
-		return decision, nil
+	skip := make(map[string]bool, len(exclude))
+	for _, id := range exclude {
+		skip[id] = true
 	}
-
-	attempts, err := r.repo.ListAttempts(ctx, p.ID)
-	if err != nil {
-		return Decision{}, fmt.Errorf("list payment attempts: %w", err)
-	}
-	failedChannels := make(map[string]struct{})
-	for _, attempt := range attempts {
-		if attempt.State == payment.AttemptChannelError {
-			failedChannels[attempt.ChannelID] = struct{}{}
-		}
-	}
-
-	channels, err := r.repo.ListChannels(ctx)
-	if err != nil {
-		return Decision{}, fmt.Errorf("list channels: %w", err)
-	}
-
-	candidates := make([]strategy.Candidate, 0, len(channels))
-	nowUTC := r.clock.Now().UTC()
-	for _, ch := range channels {
-		if _, failed := failedChannels[ch.ID]; failed {
-			decision.Excluded = append(decision.Excluded, Exclusion{ChannelID: ch.ID, Reason: ReasonPreviousChannelErr})
+	var cands []strategy.Candidate
+	var excluded []excludedInfo
+	for _, c := range all {
+		if skip[c.ChannelID] {
+			excluded = append(excluded, excludedInfo{ChannelID: c.ChannelID, Reason: "уже использовался для этого платежа"})
 			continue
 		}
-		if !ch.IsEnabled {
-			decision.Excluded = append(decision.Excluded, Exclusion{ChannelID: ch.ID, Reason: ReasonDisabled})
-			continue
-		}
+		cands = append(cands, c)
+	}
+	if len(cands) == 0 {
+		return Decision{}, ErrNoChannel
+	}
 
-		cfg, err := decodeChannelConfig(ch)
-		if err != nil {
-			return Decision{}, err
-		}
-		if cfg.MinAmount != nil && p.Amount < *cfg.MinAmount {
-			decision.Excluded = append(decision.Excluded, Exclusion{ChannelID: ch.ID, Reason: ReasonBelowMinAmount})
-			continue
-		}
-		if cfg.MaxAmount != nil && p.Amount > *cfg.MaxAmount {
-			decision.Excluded = append(decision.Excluded, Exclusion{ChannelID: ch.ID, Reason: ReasonAboveMaxAmount})
-			continue
-		}
-		available, err := isWithinSchedule(cfg.Schedule, nowUTC)
-		if err != nil {
-			return Decision{}, fmt.Errorf("channel %q schedule: %w", ch.ID, err)
-		}
-		if !available {
-			decision.Excluded = append(decision.Excluded, Exclusion{ChannelID: ch.ID, Reason: ReasonOutsideSchedule})
-			continue
-		}
+	return r.explain(amount, strategy.Rank(r.strategy, amount, cands), excluded)
+}
 
-		candidates = append(candidates, strategy.Candidate{
-			ChannelID: ch.ID,
-			Tariff:    cfg.Tariff,
-			// No health snapshot is wired in at step 1. Keep statistics neutral.
-			LatencyS: float64(ch.AvgLatencyMS) / 1000,
+func (r *Router) explain(amount int64, ranked []strategy.Scored, excluded []excludedInfo) (Decision, error) {
+	d := details{Amount: amount, Chosen: ranked[0].ChannelID, Excluded: excluded}
+	for _, s := range ranked {
+		d.Candidates = append(d.Candidates, scoredInfo{
+			ChannelID: s.ChannelID, Score: s.Score, PSuccess: s.PSuccess(), Fee: s.Tariff.Fee(amount),
 		})
 	}
-
-	decision.Ranked = strategy.Rank(r.strategy, p.Amount, candidates)
-	return decision, nil
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return Decision{}, err
+	}
+	return Decision{ChannelID: ranked[0].ChannelID, Strategy: r.strategy.Name(), Details: raw}, nil
 }
 
-func decodeChannelConfig(ch store.ChannelRecord) (channelConfig, error) {
-	var cfg channelConfig
-	if len(ch.Config) == 0 {
-		ch.Config = json.RawMessage(`{}`)
+// ChoosePayment routes with the payment history already loaded by the worker.
+func (r *Router) ChoosePayment(ctx context.Context, p payment.Payment, attempts []payment.Attempt) (Decision, error) {
+	tried := make([]string, 0, len(attempts))
+	for _, attempt := range attempts {
+		if attempt.IsLive() {
+			return Decision{}, store.ErrLiveAttemptExists
+		}
+		tried = append(tried, attempt.ChannelID)
 	}
-	if err := json.Unmarshal(ch.Config, &cfg); err != nil {
-		return channelConfig{}, fmt.Errorf("channel %q has invalid config: %w", ch.ID, err)
+	if r.source != nil {
+		return r.Choose(ctx, p.Amount, tried)
 	}
-	if cfg.MinAmount != nil && *cfg.MinAmount < 0 {
-		return channelConfig{}, fmt.Errorf("channel %q has negative min_amount", ch.ID)
-	}
-	if cfg.MaxAmount != nil && *cfg.MaxAmount < 0 {
-		return channelConfig{}, fmt.Errorf("channel %q has negative max_amount", ch.ID)
-	}
-	if cfg.MinAmount != nil && cfg.MaxAmount != nil && *cfg.MinAmount > *cfg.MaxAmount {
-		return channelConfig{}, fmt.Errorf("channel %q has min_amount greater than max_amount", ch.ID)
-	}
-	return cfg, nil
-}
-
-// isWithinSchedule accepts "24x7", an empty schedule (no restriction), or
-// "HH:MM-HH:MM". The interval is start-inclusive/end-exclusive and is evaluated
-// strictly in UTC. Overnight ranges such as 22:00-06:00 are supported.
-func isWithinSchedule(schedule string, now time.Time) (bool, error) {
-	schedule = strings.TrimSpace(schedule)
-	if schedule == "" || strings.EqualFold(schedule, "24x7") {
-		return true, nil
-	}
-
-	parts := strings.Split(schedule, "-")
-	if len(parts) != 2 {
-		return false, fmt.Errorf("invalid schedule %q: expected HH:MM-HH:MM or 24x7", schedule)
-	}
-	start, err := parseClockMinutes(parts[0])
+	decision, err := r.selectChannels(ctx, p, attempts, Decision{Strategy: r.strategy.Name()})
 	if err != nil {
-		return false, fmt.Errorf("invalid schedule %q: %w", schedule, err)
+		return Decision{}, err
 	}
-	end, err := parseClockMinutes(parts[1])
-	if err != nil {
-		return false, fmt.Errorf("invalid schedule %q: %w", schedule, err)
+	if len(decision.Ranked) == 0 {
+		return Decision{}, ErrNoChannel
 	}
-	if start == end {
-		return false, fmt.Errorf("invalid schedule %q: start and end are equal", schedule)
+	excluded := make([]excludedInfo, 0, len(decision.Excluded))
+	for _, entry := range decision.Excluded {
+		excluded = append(excluded, excludedInfo{ChannelID: entry.ChannelID, Reason: string(entry.Reason)})
 	}
-
-	utc := now.UTC()
-	current := utc.Hour()*60 + utc.Minute()
-	if start < end {
-		return current >= start && current < end, nil
-	}
-	return current >= start || current < end, nil
-}
-
-func parseClockMinutes(value string) (int, error) {
-	parsed, err := time.Parse("15:04", strings.TrimSpace(value))
-	if err != nil {
-		return 0, err
-	}
-	return parsed.Hour()*60 + parsed.Minute(), nil
+	return r.explain(p.Amount, decision.Ranked, excluded)
 }

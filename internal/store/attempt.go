@@ -49,6 +49,13 @@ func scanAttempt(row pgx.Row) (payment.Attempt, error) {
 // гонка двух воркеров невозможна: проигравший получит ErrLiveAttemptExists,
 // а его транзакция (вместе с увеличением attempts_count) откатится.
 func (d *DB) StartAttempt(ctx context.Context, paymentID, channelID string) (payment.Attempt, error) {
+	return d.StartAttemptWithDecision(ctx, paymentID, channelID, nil)
+}
+
+// StartAttemptWithDecision — то же, что StartAttempt, но решение маршрутизатора
+// (routing_decisions) пишется в той же транзакции, что и попытка: попытки без
+// объяснения выбора канала не бывает. dec == nil — решение не пишется.
+func (d *DB) StartAttemptWithDecision(ctx context.Context, paymentID, channelID string, dec *RoutingDecision) (payment.Attempt, error) {
 	var att payment.Attempt
 	err := d.Tx(ctx, func(tx pgx.Tx) error {
 		var no int
@@ -72,6 +79,15 @@ func (d *DB) StartAttempt(ctx context.Context, paymentID, channelID string) (pay
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == liveAttemptIndex {
 			return ErrLiveAttemptExists
+		}
+		if err != nil {
+			return err
+		}
+		if dec != nil {
+			_, err = tx.Exec(ctx, `
+				INSERT INTO routing_decisions (payment_id, attempt_no, strategy, decision)
+				VALUES ($1, $2, $3, $4)`,
+				paymentID, att.AttemptNo, dec.Strategy, dec.detailsOrEmpty())
 		}
 		return err
 	})
