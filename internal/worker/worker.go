@@ -40,7 +40,7 @@ type Config struct {
 	Workers        int           // параллельных циклов обработки (1)
 	IdleWait       time.Duration // пауза, когда очередь пуста (500 мс)
 	ChargeTimeout  time.Duration // предел ожидания ответа канала (10 с)
-	PersistTimeout time.Duration // предел записи результата в БД (5 с)
+	PersistTimeout time.Duration // предел подготовки и отдельно записи результата (5 с)
 	RetryBase      time.Duration // пауза перед 2-й попыткой; дальше удваивается (1 с)
 	RetryMax       time.Duration // потолок паузы между попытками (30 с)
 	ReconcileDelay time.Duration // через сколько сверщик впервые смотрит на RECONCILING (5 с)
@@ -90,7 +90,9 @@ func New(st Store, rt Router, channels []channel.PaymentChannel, clk clock.Clock
 	}
 }
 
-// Run запускает cfg.Workers циклов и ждёт их завершения после отмены ctx.
+// Run запускает cfg.Workers циклов. После отмены ctx воркеры не берут новые платежи,
+// но доводят до конца те, что уже взяты (включая вызов канала), и только потом
+// Run возвращается. Подготовка, вызов канала и запись исхода ограничены таймаутами.
 func (w *Worker) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for i := 0; i < w.cfg.Workers; i++ {
@@ -122,6 +124,11 @@ func (w *Worker) loop(ctx context.Context) {
 }
 
 // ProcessOne обрабатывает один платёж из очереди. false — очередь пуста.
+//
+// ctx управляет только захватом платежа. Взятый платёж обрабатывается до конца
+// независимо от отмены ctx: оборвать вызов канала на середине значило бы получить
+// UNKNOWN и ненужную сверку, хотя канал мог спокойно ответить. Время вызова
+// ограничено ChargeTimeout, подготовка и запись результата — PersistTimeout.
 func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 	p, ok, err := w.store.ClaimPayment(ctx, w.clock.Now())
 	if err != nil {
@@ -130,11 +137,13 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	return true, w.process(ctx, p)
+	return true, w.process(context.WithoutCancel(ctx), p)
 }
 
 func (w *Worker) process(ctx context.Context, p payment.Payment) error {
-	attempts, err := w.store.ListAttempts(ctx, p.ID)
+	prepareCtx, cancelPrepare := w.persistCtx(ctx)
+	defer cancelPrepare()
+	attempts, err := w.store.ListAttempts(prepareCtx, p.ID)
 	if err != nil {
 		return w.release(ctx, p, "прочитать попытки", err)
 	}
@@ -143,7 +152,7 @@ func (w *Worker) process(ctx context.Context, p payment.Payment) error {
 		tried = append(tried, a.ChannelID)
 	}
 
-	dec, err := w.router.Choose(ctx, p.Amount, tried)
+	dec, err := w.router.Choose(prepareCtx, p.Amount, tried)
 	switch {
 	case errors.Is(err, router.ErrNoChannel):
 		return w.finish(ctx, p, payment.Failed, 0, "нет доступного канала")
@@ -157,7 +166,7 @@ func (w *Worker) process(ctx context.Context, p payment.Payment) error {
 
 	// Попытка пишется в БД ДО обращения к каналу: если процесс упадёт посреди
 	// вызова, в БД останется STARTED, и сверщик выяснит исход по ключу попытки.
-	att, err := w.store.StartAttemptWithDecision(ctx, p.ID, dec.ChannelID,
+	att, err := w.store.StartAttemptWithDecision(prepareCtx, p.ID, dec.ChannelID,
 		&store.RoutingDecision{Strategy: dec.Strategy, Details: dec.Details})
 	switch {
 	case errors.Is(err, store.ErrLiveAttemptExists):
@@ -169,6 +178,7 @@ func (w *Worker) process(ctx context.Context, p payment.Payment) error {
 		return w.release(ctx, p, "записать попытку", err)
 	}
 
+	cancelPrepare()
 	res := w.charge(ctx, ch, att, p)
 	pl := w.plan(res, att.AttemptNo)
 
