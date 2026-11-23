@@ -25,9 +25,9 @@ type Store interface {
 	TransitionStatusAt(ctx context.Context, id string, from, to payment.State, nextRunAt time.Time, reason string) (bool, error)
 }
 
-// Router выбирает канал; exclude — каналы, уже пробовавшиеся для платежа.
+// Router выбирает канал с учётом уже сделанных попыток.
 type Router interface {
-	Choose(ctx context.Context, amount int64, exclude []string) (router.Decision, error)
+	ChoosePayment(ctx context.Context, p payment.Payment, attempts []payment.Attempt) (router.Decision, error)
 }
 
 var (
@@ -147,13 +147,10 @@ func (w *Worker) process(ctx context.Context, p payment.Payment) error {
 	if err != nil {
 		return w.release(ctx, p, "прочитать попытки", err)
 	}
-	tried := make([]string, 0, len(attempts))
-	for _, a := range attempts {
-		tried = append(tried, a.ChannelID)
-	}
-
-	dec, err := w.router.Choose(prepareCtx, p.Amount, tried)
+	dec, err := w.router.ChoosePayment(prepareCtx, p, attempts)
 	switch {
+	case errors.Is(err, store.ErrLiveAttemptExists):
+		return w.finish(ctx, p, payment.Reconciling, w.cfg.ReconcileDelay, "уже есть незавершённая попытка")
 	case errors.Is(err, router.ErrNoChannel):
 		return w.finish(ctx, p, payment.Failed, 0, "нет доступного канала")
 	case err != nil:

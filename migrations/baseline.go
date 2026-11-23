@@ -1,0 +1,279 @@
+package migrations
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"sort"
+)
+
+// Структура первоначальной версии проекта.
+// Baseline предназначен только для схемы, созданной старыми миграциями.
+const legacyVersion int64 = 2
+
+var requiredColumns = map[string][]string{
+	"payments": {
+		"id",
+		"idempotency_key",
+		"amount",
+		"currency",
+		"state",
+		"attempts_count",
+		"next_run_at",
+		"created_at",
+		"updated_at",
+	},
+	"attempts": {
+		"id",
+		"payment_id",
+		"attempt_no",
+		"channel_id",
+		"channel_key",
+		"state",
+		"started_at",
+		"finished_at",
+	},
+	"payment_events": {
+		"id",
+		"payment_id",
+		"from_state",
+		"to_state",
+		"reason",
+		"at",
+	},
+	"routing_decisions": {
+		"id",
+		"payment_id",
+		"attempt_no",
+		"strategy",
+		"decision",
+		"at",
+	},
+	"channel_events": {
+		"id",
+		"channel_id",
+		"from_state",
+		"to_state",
+		"details",
+		"at",
+	},
+	"channel_ledger": {
+		"channel_id",
+		"channel_key",
+		"amount",
+		"status",
+		"at",
+	},
+	"experiment_runs": {
+		"id",
+		"scenario",
+		"strategy",
+		"seed",
+		"metrics",
+		"at",
+	},
+	"channels": {
+		"id",
+		"name",
+		"is_enabled",
+		"avg_latency_ms",
+		"config",
+		"created_at",
+	},
+}
+
+// Baseline регистрирует старые миграции,
+// не выполняя повторно SQL-команды создания таблиц.
+func Baseline(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("baseline: database connection is nil")
+	}
+
+	var versionTableExists bool
+
+	err := db.QueryRowContext(
+		ctx,
+		`SELECT to_regclass('public.goose_db_version') IS NOT NULL`,
+	).Scan(&versionTableExists)
+
+	if err != nil {
+		return fmt.Errorf("baseline: check goose table: %w", err)
+	}
+
+	if versionTableExists {
+		return fmt.Errorf(
+			"baseline: goose_db_version already exists; use up or status",
+		)
+	}
+
+	// Проверяем наличие обязательных столбцов старой схемы.
+	rows, err := db.QueryContext(ctx, `
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+    `)
+	if err != nil {
+		return fmt.Errorf("baseline: inspect columns: %w", err)
+	}
+
+	existingColumns := make(map[string]map[string]bool)
+
+	for rows.Next() {
+		var tableName, columnName string
+
+		if err := rows.Scan(&tableName, &columnName); err != nil {
+			rows.Close()
+			return fmt.Errorf("baseline: read column: %w", err)
+		}
+
+		if existingColumns[tableName] == nil {
+			existingColumns[tableName] = make(map[string]bool)
+		}
+
+		existingColumns[tableName][columnName] = true
+	}
+
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("baseline: iterate columns: %w", err)
+	}
+
+	rows.Close()
+
+	var missingColumns []string
+
+	for table, columns := range requiredColumns {
+		for _, column := range columns {
+			if !existingColumns[table][column] {
+				missingColumns = append(
+					missingColumns,
+					table+"."+column,
+				)
+			}
+		}
+	}
+
+	if len(missingColumns) > 0 {
+		sort.Strings(missingColumns)
+
+		return fmt.Errorf(
+			"baseline: legacy schema is incomplete; missing columns: %v",
+			missingColumns,
+		)
+	}
+
+	// Проверяем два индекса первоначальной схемы.
+	indexRows, err := db.QueryContext(ctx, `
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+    `)
+	if err != nil {
+		return fmt.Errorf("baseline: inspect indexes: %w", err)
+	}
+
+	existingIndexes := make(map[string]bool)
+
+	for indexRows.Next() {
+		var name string
+
+		if err := indexRows.Scan(&name); err != nil {
+			indexRows.Close()
+			return fmt.Errorf("baseline: read index: %w", err)
+		}
+
+		existingIndexes[name] = true
+	}
+
+	if err := indexRows.Err(); err != nil {
+		indexRows.Close()
+		return fmt.Errorf("baseline: iterate indexes: %w", err)
+	}
+
+	indexRows.Close()
+
+	requiredIndexes := []string{
+		"payments_queue_idx",
+		"attempts_one_live_idx",
+	}
+
+	var missingIndexes []string
+
+	for _, name := range requiredIndexes {
+		if !existingIndexes[name] {
+			missingIndexes = append(missingIndexes, name)
+		}
+	}
+
+	if len(missingIndexes) > 0 {
+		return fmt.Errorf(
+			"baseline: missing indexes: %v",
+			missingIndexes,
+		)
+	}
+
+	// Проверяем наличие четырёх стандартных каналов.
+	var channelCount int
+
+	err = db.QueryRowContext(ctx, `
+        SELECT COUNT(*)
+        FROM public.channels
+        WHERE id IN ($1, $2, $3, $4)
+    `,
+		"ch_cheap_slow",
+		"ch_fast_expensive",
+		"ch_balanced",
+		"ch_night_only",
+	).Scan(&channelCount)
+
+	if err != nil {
+		return fmt.Errorf("baseline: check seed channels: %w", err)
+	}
+
+	if channelCount != 4 {
+		return fmt.Errorf(
+			"baseline: expected 4 standard channels, found %d",
+			channelCount,
+		)
+	}
+
+	// Все проверки пройдены.
+	// Создаём историю Goose в одной транзакции.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("baseline: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Структура таблицы соответствует формату Goose для PostgreSQL.
+	_, err = tx.ExecContext(ctx, `
+        CREATE TABLE public.goose_db_version (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            version_id BIGINT NOT NULL,
+            is_applied BOOLEAN NOT NULL,
+            tstamp TIMESTAMP NULL DEFAULT now()
+        )
+    `)
+	if err != nil {
+		return fmt.Errorf("baseline: create version table: %w", err)
+	}
+
+	// Версия 0 — начальная версия Goose.
+	// Версии 1 и 2 — уже выполненные старые миграции.
+	_, err = tx.ExecContext(ctx, `
+        INSERT INTO public.goose_db_version (version_id, is_applied)
+        VALUES
+            (0, TRUE),
+            (1, TRUE),
+            ($1, TRUE)
+    `, legacyVersion)
+	if err != nil {
+		return fmt.Errorf("baseline: register versions: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("baseline: commit: %w", err)
+	}
+
+	return nil
+}

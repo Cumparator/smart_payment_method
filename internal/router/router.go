@@ -5,6 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/Cumparator/smart_payment_method/internal/clock"
+	"github.com/Cumparator/smart_payment_method/internal/payment"
+	"github.com/Cumparator/smart_payment_method/internal/store"
+
 	"github.com/Cumparator/smart_payment_method/internal/strategy"
 )
 
@@ -13,9 +17,12 @@ var ErrNoChannel = errors.New("router: нет доступных каналов"
 
 // Decision — выбранный канал и объяснение выбора (пишется в routing_decisions).
 type Decision struct {
-	ChannelID string
-	Strategy  string
-	Details   json.RawMessage
+	ChannelID   string
+	Strategy    string
+	Details     json.RawMessage
+	Ranked      []strategy.Scored
+	Excluded    []Exclusion
+	LiveAttempt *payment.Attempt
 }
 
 // Source отдаёт снимок каналов, допущенных к выбору (включённых, с живым breaker).
@@ -34,6 +41,8 @@ func (s StaticSource) Candidates(context.Context) ([]strategy.Candidate, error) 
 type Router struct {
 	strategy strategy.Strategy
 	source   Source
+	repo     Repository
+	clock    clock.Clock
 }
 
 func New(s strategy.Strategy, src Source) *Router {
@@ -83,7 +92,10 @@ func (r *Router) Choose(ctx context.Context, amount int64, exclude []string) (De
 		return Decision{}, ErrNoChannel
 	}
 
-	ranked := strategy.Rank(r.strategy, amount, cands)
+	return r.explain(amount, strategy.Rank(r.strategy, amount, cands), excluded)
+}
+
+func (r *Router) explain(amount int64, ranked []strategy.Scored, excluded []excludedInfo) (Decision, error) {
 	d := details{Amount: amount, Chosen: ranked[0].ChannelID, Excluded: excluded}
 	for _, s := range ranked {
 		d.Candidates = append(d.Candidates, scoredInfo{
@@ -95,4 +107,30 @@ func (r *Router) Choose(ctx context.Context, amount int64, exclude []string) (De
 		return Decision{}, err
 	}
 	return Decision{ChannelID: ranked[0].ChannelID, Strategy: r.strategy.Name(), Details: raw}, nil
+}
+
+// ChoosePayment routes with the payment history already loaded by the worker.
+func (r *Router) ChoosePayment(ctx context.Context, p payment.Payment, attempts []payment.Attempt) (Decision, error) {
+	tried := make([]string, 0, len(attempts))
+	for _, attempt := range attempts {
+		if attempt.IsLive() {
+			return Decision{}, store.ErrLiveAttemptExists
+		}
+		tried = append(tried, attempt.ChannelID)
+	}
+	if r.source != nil {
+		return r.Choose(ctx, p.Amount, tried)
+	}
+	decision, err := r.selectChannels(ctx, p, attempts, Decision{Strategy: r.strategy.Name()})
+	if err != nil {
+		return Decision{}, err
+	}
+	if len(decision.Ranked) == 0 {
+		return Decision{}, ErrNoChannel
+	}
+	excluded := make([]excludedInfo, 0, len(decision.Excluded))
+	for _, entry := range decision.Excluded {
+		excluded = append(excluded, excludedInfo{ChannelID: entry.ChannelID, Reason: string(entry.Reason)})
+	}
+	return r.explain(p.Amount, decision.Ranked, excluded)
 }
