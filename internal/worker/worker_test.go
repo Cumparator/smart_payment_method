@@ -538,3 +538,33 @@ func TestRunGracefulStop(t *testing.T) {
 		t.Errorf("late: state = %s, want RECEIVED (после остановки платежи не берутся)", p.State)
 	}
 }
+
+type deadlineStore struct {
+	*fakeStore
+}
+
+func (s deadlineStore) ListAttempts(ctx context.Context, _ string) ([]payment.Attempt, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, errors.New("missing preparation deadline")
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestPreparationTimeoutRequeuesPayment(t *testing.T) {
+	f := newFixture(t, &fakeChannel{id: "cheap"})
+	f.w.store = deadlineStore{f.st}
+	f.w.cfg.PersistTimeout = 20 * time.Millisecond
+	f.st.add("p", 10000, f.clk.Now())
+
+	did, err := f.w.ProcessOne(context.Background())
+	if !did || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ProcessOne = (%v, %v), want claimed payment and deadline exceeded", did, err)
+	}
+	if p := f.st.pay("p"); p.State != payment.Received || !p.NextRunAt.After(f.clk.Now()) {
+		t.Fatalf("payment = %+v, want back in queue with a retry delay", p)
+	}
+	if attempts := f.st.att("p"); len(attempts) != 0 {
+		t.Fatalf("attempts = %+v, want none", attempts)
+	}
+}
