@@ -25,7 +25,10 @@ type BreakerConfig struct {
 	Window              int           // сколько последних исходов канала смотрим (20)
 	MinAttempts         int           // сколько исходов в окне нужно, чтобы судить по доле (10)
 	FailureRate         float64       // доля неудач в окне, после которой канал отключается (0.5)
-	OpenFor             time.Duration // сколько канал отключён до пробного запроса (30 с)
+	OpenFor             time.Duration // сколько канал отключён до пробных запросов (30 с)
+	MaxOpenFor          time.Duration // потолок паузы: после каждой неудачной пробы она удваивается (5 мин)
+	Probes              int           // пробных запросов одновременно в HALF_OPEN (1)
+	ProbeSuccesses      int           // удачных проб подряд, после которых канал включается (3)
 }
 
 func (c BreakerConfig) withDefaults() BreakerConfig {
@@ -44,6 +47,15 @@ func (c BreakerConfig) withDefaults() BreakerConfig {
 	if c.OpenFor <= 0 {
 		c.OpenFor = 30 * time.Second
 	}
+	if c.MaxOpenFor < c.OpenFor {
+		c.MaxOpenFor = max(c.OpenFor, 5*time.Minute)
+	}
+	if c.Probes <= 0 {
+		c.Probes = 1
+	}
+	if c.ProbeSuccesses <= 0 {
+		c.ProbeSuccesses = 3
+	}
 	return c
 }
 
@@ -56,7 +68,10 @@ type Transition struct {
 }
 
 // Breaker — предохранитель одного канала: отключает его при частых технических
-// ошибках и включает обратно, когда пробный запрос проходит.
+// ошибках и включает обратно осторожно. Когда пауза проходит, канал получает
+// несколько пробных запросов (не больше Probes одновременно); он включается,
+// только если подряд прошли ProbeSuccesses проб. Любая неудачная проба снова
+// отключает канал, и пауза растёт вдвое, до MaxOpenFor.
 //
 // Неудача — это CHANNEL_ERROR и UNKNOWN (таймаут). Бизнес-отказ DECLINED
 // неудачей не считается: канал ответил, значит жив.
@@ -74,7 +89,9 @@ type Breaker struct {
 	fails    int // неудач в окне
 	consec   int // неудач подряд
 	openedAt time.Time
-	probing  bool // пробный запрос в полёте
+	openFor  time.Duration // текущая пауза; растёт после неудачных проб
+	probing  int           // пробных запросов в полёте
+	probeOK  int           // удачных проб подряд
 }
 
 // NewBreaker создаёт предохранитель в состоянии CLOSED. onChange вызывается после
@@ -84,7 +101,7 @@ func NewBreaker(channelID string, cfg BreakerConfig, clk clock.Clock, onChange f
 	if clk == nil {
 		clk = clock.Real{}
 	}
-	return &Breaker{id: channelID, cfg: cfg, clock: clk, onChange: onChange, state: Closed, ring: make([]bool, cfg.Window)}
+	return &Breaker{id: channelID, cfg: cfg, clock: clk, onChange: onChange, state: Closed, openFor: cfg.OpenFor, ring: make([]bool, cfg.Window)}
 }
 
 func isFailure(o channel.ChargeOutcome) bool {
@@ -101,7 +118,8 @@ func (b *Breaker) State() State {
 	return st
 }
 
-// Allow решает, пускать ли запрос в канал. В HALF_OPEN пускает один пробный запрос.
+// Allow решает, пускать ли запрос в канал. В HALF_OPEN пускает пробные запросы,
+// пока их в полёте меньше Probes; за каждый пущенный нужно вызвать Record или Cancel.
 func (b *Breaker) Allow() bool {
 	b.mu.Lock()
 	tr := b.refreshLocked(b.clock.Now())
@@ -110,13 +128,33 @@ func (b *Breaker) Allow() bool {
 	case Closed:
 		ok = true
 	case HalfOpen:
-		if !b.probing {
-			b.probing, ok = true, true
+		if b.probing < b.cfg.Probes {
+			b.probing++
+			ok = true
 		}
 	}
 	b.mu.Unlock()
 	b.emit(tr)
 	return ok
+}
+
+// CanAdmit — то же, что Allow, но ничего не занимает: можно ли пустить запрос сейчас.
+func (b *Breaker) CanAdmit() bool {
+	b.mu.Lock()
+	tr := b.refreshLocked(b.clock.Now())
+	ok := b.state == Closed || (b.state == HalfOpen && b.probing < b.cfg.Probes)
+	b.mu.Unlock()
+	b.emit(tr)
+	return ok
+}
+
+// Cancel возвращает пробу, занятую в Allow, если запрос так и не ушёл в канал.
+func (b *Breaker) Cancel() {
+	b.mu.Lock()
+	if b.state == HalfOpen && b.probing > 0 {
+		b.probing--
+	}
+	b.mu.Unlock()
 }
 
 // Record учитывает исход запроса, пущенного через Allow.
@@ -141,7 +179,7 @@ func (b *Breaker) Record(o channel.ChargeOutcome) {
 
 // refreshLocked переводит OPEN в HALF_OPEN, когда пауза прошла.
 func (b *Breaker) refreshLocked(now time.Time) []Transition {
-	if b.state == Open && now.Sub(b.openedAt) >= b.cfg.OpenFor {
+	if b.state == Open && now.Sub(b.openedAt) >= b.openFor {
 		return []Transition{b.moveLocked(HalfOpen, now, "пауза прошла, пробуем канал")}
 	}
 	return nil
@@ -178,12 +216,19 @@ func (b *Breaker) recordClosedLocked(now time.Time, failure bool) *Transition {
 }
 
 func (b *Breaker) recordProbeLocked(now time.Time, failure bool) *Transition {
-	b.probing = false
+	if b.probing > 0 {
+		b.probing--
+	}
 	if failure {
-		t := b.moveLocked(Open, now, "пробный запрос не прошёл")
+		b.openFor = min(b.openFor*2, b.cfg.MaxOpenFor)
+		t := b.moveLocked(Open, now, fmt.Sprintf("пробный запрос не прошёл, следующая пауза %s", b.openFor))
 		return &t
 	}
-	t := b.moveLocked(Closed, now, "пробный запрос прошёл")
+	b.probeOK++
+	if b.probeOK < b.cfg.ProbeSuccesses {
+		return nil
+	}
+	t := b.moveLocked(Closed, now, fmt.Sprintf("проб подряд прошло: %d", b.probeOK))
 	return &t
 }
 
@@ -191,12 +236,13 @@ func (b *Breaker) recordProbeLocked(now time.Time, failure bool) *Transition {
 func (b *Breaker) moveLocked(to State, now time.Time, reason string) Transition {
 	t := Transition{ChannelID: b.id, From: b.state, To: to, At: now, Reason: reason}
 	b.state = to
-	b.probing = false
+	b.probing, b.probeOK = 0, 0
 	switch to {
 	case Open:
 		b.openedAt = now
 	case Closed:
 		b.head, b.filled, b.fails, b.consec = 0, 0, 0, 0
+		b.openFor = b.cfg.OpenFor
 	}
 	return t
 }

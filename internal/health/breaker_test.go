@@ -17,6 +17,16 @@ func newBreaker(t *testing.T, cfg BreakerConfig) (*Breaker, *clock.Virtual, *[]T
 	return b, clk, &log
 }
 
+// probe пускает n удачных пробных запросов по одному.
+func probe(b *Breaker, n int) {
+	for range n {
+		if !b.Allow() {
+			panic("проба не прошла Allow")
+		}
+		b.Record(channel.Approved)
+	}
+}
+
 func fail(b *Breaker, n int) {
 	for range n {
 		b.Record(channel.ChannelError)
@@ -109,8 +119,11 @@ func TestBreakerProbeSuccessCloses(t *testing.T) {
 	fail(b, 2)
 	clk.Advance(time.Minute)
 
-	b.Allow()
-	b.Record(channel.Approved)
+	probe(b, 2)
+	if b.State() != HalfOpen {
+		t.Fatalf("после 2 проб из 3 состояние %s, ожидалось HALF_OPEN", b.State())
+	}
+	probe(b, 1)
 	if b.State() != Closed || !b.Allow() {
 		t.Fatalf("состояние %s, ожидалось CLOSED", b.State())
 	}
@@ -141,8 +154,7 @@ func TestBreakerReportsTransitionsInOrder(t *testing.T) {
 	b, clk, log := newBreaker(t, BreakerConfig{ConsecutiveFailures: 2, OpenFor: time.Minute})
 	fail(b, 2)
 	clk.Advance(time.Minute)
-	b.Allow()
-	b.Record(channel.Approved)
+	probe(b, 3)
 
 	want := []struct{ from, to State }{{Closed, Open}, {Open, HalfOpen}, {HalfOpen, Closed}}
 	if len(*log) != len(want) {
@@ -176,4 +188,109 @@ func TestBreakerConcurrentUse(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestBreakerFailedProbeDoublesPauseUpToMax(t *testing.T) {
+	b, clk, _ := newBreaker(t, BreakerConfig{ConsecutiveFailures: 1, OpenFor: 10 * time.Second, MaxOpenFor: 35 * time.Second})
+	fail(b, 1)
+
+	for _, pause := range []time.Duration{10, 20, 35, 35} { // 10 → 20 → 40, но не больше 35
+		clk.Advance(pause*time.Second - time.Second)
+		if b.State() != Open {
+			t.Fatalf("за секунду до конца паузы %s канал уже не OPEN", pause*time.Second)
+		}
+		clk.Advance(time.Second)
+		if b.State() != HalfOpen {
+			t.Fatalf("после паузы %s канал не HALF_OPEN", pause*time.Second)
+		}
+		b.Allow()
+		b.Record(channel.ChannelError)
+	}
+}
+
+func TestBreakerClosingResetsPause(t *testing.T) {
+	b, clk, _ := newBreaker(t, BreakerConfig{ConsecutiveFailures: 1, OpenFor: 10 * time.Second, ProbeSuccesses: 1})
+	fail(b, 1)
+	clk.Advance(10 * time.Second)
+	b.Allow()
+	b.Record(channel.ChannelError) // пауза выросла до 20 с
+	clk.Advance(20 * time.Second)
+	probe(b, 1) // канал снова включён
+
+	fail(b, 1)
+	clk.Advance(10 * time.Second)
+	if b.State() != HalfOpen {
+		t.Fatalf("состояние %s: после включения пауза должна вернуться к 10 с", b.State())
+	}
+}
+
+func TestBreakerFailureBreaksProbeStreak(t *testing.T) {
+	b, clk, _ := newBreaker(t, BreakerConfig{ConsecutiveFailures: 1, OpenFor: time.Second, ProbeSuccesses: 3})
+	fail(b, 1)
+	clk.Advance(time.Second)
+	probe(b, 2)
+	b.Allow()
+	b.Record(channel.Unknown) // третья проба — таймаут: серия сорвана
+	if b.State() != Open {
+		t.Fatalf("состояние %s, ожидалось OPEN", b.State())
+	}
+	clk.Advance(2 * time.Second)
+	probe(b, 2)
+	if b.State() != HalfOpen {
+		t.Fatal("серия проб должна начинаться заново")
+	}
+}
+
+func TestBreakerLimitsConcurrentProbes(t *testing.T) {
+	b, clk, _ := newBreaker(t, BreakerConfig{ConsecutiveFailures: 1, OpenFor: time.Second, Probes: 2})
+	fail(b, 1)
+	clk.Advance(time.Second)
+
+	first, second := b.Allow(), b.Allow()
+	if !first || !second {
+		t.Fatal("две пробы должны пройти")
+	}
+	if b.Allow() || b.CanAdmit() {
+		t.Fatal("третью пробу пускать нельзя")
+	}
+	b.Record(channel.Approved) // одна проба закончилась, место освободилось
+	if !b.CanAdmit() {
+		t.Fatal("после ответа должно быть место для новой пробы")
+	}
+}
+
+func TestBreakerCancelReturnsProbe(t *testing.T) {
+	b, clk, _ := newBreaker(t, BreakerConfig{ConsecutiveFailures: 1, OpenFor: time.Second})
+	fail(b, 1)
+	clk.Advance(time.Second)
+
+	if !b.Allow() {
+		t.Fatal("проба должна пройти")
+	}
+	b.Cancel() // запрос так и не ушёл в канал
+	if !b.Allow() {
+		t.Fatal("после Cancel проба должна снова быть доступна")
+	}
+	b.Cancel()
+	b.Cancel() // лишний Cancel не уводит счётчик в минус
+	if !b.Allow() || b.Allow() {
+		t.Fatal("после лишних Cancel должна быть ровно одна проба")
+	}
+}
+
+func TestBreakerCanAdmitTakesNothing(t *testing.T) {
+	b, clk, _ := newBreaker(t, BreakerConfig{ConsecutiveFailures: 1, OpenFor: time.Second})
+	fail(b, 1)
+	if b.CanAdmit() {
+		t.Fatal("в OPEN запрос пускать нельзя")
+	}
+	clk.Advance(time.Second)
+	for range 5 {
+		if !b.CanAdmit() {
+			t.Fatal("CanAdmit не должен занимать пробу")
+		}
+	}
+	if !b.Allow() {
+		t.Fatal("проба должна быть свободна после CanAdmit")
+	}
 }
