@@ -13,6 +13,7 @@ type Unavailable string
 
 const (
 	BreakerOpen Unavailable = "breaker_open" // предохранитель отключил канал или идут пробы
+	Overloaded  Unavailable = "overloaded"   // все места под одновременные запросы заняты
 )
 
 // Slot — запрос, допущенный в канал. Его обязательно закрыть одним из двух
@@ -50,6 +51,19 @@ func (s *Slot) Cancel() {
 	}
 }
 
+// reserveLimited занимает место под запрос, если лимит одновременных запросов
+// канала (см. Register) не исчерпан. Проверка и занятие — одним действием.
+func (r *Registry) reserveLimited(channelID string) (*Slot, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.stats(channelID)
+	if s.maxInflight > 0 && s.inflight >= s.maxInflight {
+		return nil, false
+	}
+	s.inflight++
+	return &Slot{r: r, id: channelID, breaker: s.breaker}, true
+}
+
 // reserve занимает место под запрос без проверок.
 func (r *Registry) reserve(channelID string) *Slot {
 	r.mu.Lock()
@@ -65,10 +79,14 @@ func (r *Registry) release(channelID string) {
 	r.mu.Unlock()
 }
 
-// TryBegin пускает запрос в канал, если предохранитель это позволяет. При отказе
-// слот nil, а причина в Unavailable. В состоянии HALF_OPEN запрос занимает пробу.
+// TryBegin пускает запрос в канал, если не исчерпан лимит одновременных запросов
+// и предохранитель не против. При отказе слот nil, а причина в Unavailable.
+// В состоянии HALF_OPEN запрос занимает пробу.
 func (r *Registry) TryBegin(channelID string) (*Slot, Unavailable) {
-	slot := r.reserve(channelID)
+	slot, ok := r.reserveLimited(channelID)
+	if !ok {
+		return nil, Overloaded
+	}
 	if slot.breaker != nil && !slot.breaker.Allow() {
 		slot.used.Store(true)
 		r.release(channelID)
@@ -81,10 +99,14 @@ func (r *Registry) TryBegin(channelID string) (*Slot, Unavailable) {
 // Ничего не занимает: между проверкой и TryBegin место может уйти другому.
 func (r *Registry) Unavailable(channelID string) Unavailable {
 	r.mu.Lock()
-	b := r.stats(channelID).breaker
+	s := r.stats(channelID)
+	b, full := s.breaker, s.maxInflight > 0 && s.inflight >= s.maxInflight
 	r.mu.Unlock()
-	if b != nil && !b.CanAdmit() {
+	switch {
+	case b != nil && !b.CanAdmit():
 		return BreakerOpen
+	case full:
+		return Overloaded
 	}
 	return ""
 }

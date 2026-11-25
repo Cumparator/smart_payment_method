@@ -1,6 +1,8 @@
 package health
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -135,4 +137,105 @@ func TestOnStateChangeMayCallRegistry(t *testing.T) {
 		_ = r.Unavailable("A")
 	}))
 	charge(t, r, "A", channel.ChannelError)
+}
+
+func TestTryBeginLimitsConcurrentRequests(t *testing.T) {
+	r := New(10)
+	r.Register("A", 0, 2)
+
+	s1, why1 := r.TryBegin("A")
+	s2, why2 := r.TryBegin("A")
+	if why1 != "" || why2 != "" {
+		t.Fatalf("два запроса должны пройти: %q %q", why1, why2)
+	}
+	if slot, why := r.TryBegin("A"); slot != nil || why != Overloaded {
+		t.Fatalf("третий запрос: %v %q, ожидался отказ Overloaded", slot, why)
+	}
+	if r.Unavailable("A") != Overloaded {
+		t.Fatalf("Unavailable = %q, ожидалось overloaded", r.Unavailable("A"))
+	}
+	if got := r.Snapshot("A").Load; got != 1 {
+		t.Fatalf("загрузка %.2f, ожидалась 1", got)
+	}
+
+	s1.Done(channel.Approved, time.Second)
+	if _, why := r.TryBegin("A"); why != "" {
+		t.Fatal("после ответа место должно освободиться")
+	}
+	s2.Cancel()
+	if r.Unavailable("A") != "" {
+		t.Fatal("после Cancel место должно освободиться")
+	}
+}
+
+func TestLimitIsPerChannel(t *testing.T) {
+	r := New(10)
+	r.Register("A", 0, 1)
+	r.Register("B", 0, 1)
+	if _, why := r.TryBegin("A"); why != "" {
+		t.Fatal(why)
+	}
+	if _, why := r.TryBegin("B"); why != "" {
+		t.Fatalf("лимит канала A не должен занимать места в B: %q", why)
+	}
+}
+
+func TestNoLimitMeansUnlimited(t *testing.T) {
+	r := New(10)
+	for range 100 {
+		if _, why := r.TryBegin("A"); why != "" {
+			t.Fatalf("канал без лимита отказал: %q", why)
+		}
+	}
+}
+
+func TestBreakerRefusalDoesNotLeakPlace(t *testing.T) {
+	r, _, _ := newGuarded(t, BreakerConfig{ConsecutiveFailures: 1})
+	r.Register("A", 0, 1)
+	charge(t, r, "A", channel.ChannelError) // предохранитель открыт
+
+	for range 5 {
+		if _, why := r.TryBegin("A"); why != BreakerOpen {
+			t.Fatalf("причина %q, ожидалось breaker_open", why)
+		}
+	}
+	if got := r.Snapshot("A").Load; got != 0 {
+		t.Fatalf("загрузка %.2f: отказанные запросы не должны занимать места", got)
+	}
+}
+
+func TestBreakerReportedBeforeOverload(t *testing.T) {
+	r, _, _ := newGuarded(t, BreakerConfig{ConsecutiveFailures: 1})
+	r.Register("A", 0, 1)
+	slot, _ := r.TryBegin("A")
+	slot.Done(channel.ChannelError, time.Second) // открыт
+	r.Begin("A")                                 // и все места заняты
+	if got := r.Unavailable("A"); got != BreakerOpen {
+		t.Fatalf("причина %q: отключение важнее загрузки", got)
+	}
+}
+
+func TestTryBeginConcurrentNeverExceedsLimit(t *testing.T) {
+	const limit = 5
+	r := New(10)
+	r.Register("A", 0, limit)
+
+	var wg sync.WaitGroup
+	var admitted atomic.Int32
+	start := make(chan struct{})
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, why := r.TryBegin("A"); why == "" {
+				admitted.Add(1) // слот не закрываем: места остаются занятыми
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := admitted.Load(); got != limit {
+		t.Fatalf("пущено %d запросов при лимите %d", got, limit)
+	}
 }
