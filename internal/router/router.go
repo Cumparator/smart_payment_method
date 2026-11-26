@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/Cumparator/smart_payment_method/internal/clock"
+	"github.com/Cumparator/smart_payment_method/internal/health"
 	"github.com/Cumparator/smart_payment_method/internal/payment"
 	"github.com/Cumparator/smart_payment_method/internal/store"
 
@@ -37,16 +38,31 @@ func (s StaticSource) Candidates(context.Context) ([]strategy.Candidate, error) 
 	return append([]strategy.Candidate(nil), s...), nil
 }
 
+// Health — состояние каналов, которое учитывает роутер. Реализует *health.Registry.
+type Health interface {
+	Snapshot(channelID string) health.Snapshot
+}
+
+var _ Health = (*health.Registry)(nil)
+
 // Router выбирает канал в два этапа: фильтрация, затем оценка стратегией.
 type Router struct {
 	strategy strategy.Strategy
 	source   Source
 	repo     Repository
 	clock    clock.Clock
+	health   Health
 }
 
 func New(s strategy.Strategy, src Source) *Router {
 	return &Router{strategy: s, source: src}
+}
+
+// WithHealth подключает статистику каналов: вероятность успеха, задержку и
+// загрузку стратегии берут из неё. Без неё роутер считает статистику нейтральной.
+func (r *Router) WithHealth(h Health) *Router {
+	r.health = h
+	return r
 }
 
 type scoredInfo struct {
