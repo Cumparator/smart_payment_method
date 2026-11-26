@@ -11,6 +11,7 @@ import (
 
 	"github.com/Cumparator/smart_payment_method/internal/channel"
 	"github.com/Cumparator/smart_payment_method/internal/clock"
+	"github.com/Cumparator/smart_payment_method/internal/health"
 	"github.com/Cumparator/smart_payment_method/internal/payment"
 	"github.com/Cumparator/smart_payment_method/internal/router"
 	"github.com/Cumparator/smart_payment_method/internal/store"
@@ -44,6 +45,7 @@ type Config struct {
 	RetryBase      time.Duration // пауза перед 2-й попыткой; дальше удваивается (1 с)
 	RetryMax       time.Duration // потолок паузы между попытками (30 с)
 	ReconcileDelay time.Duration // через сколько сверщик впервые смотрит на RECONCILING (5 с)
+	BusyWait       time.Duration // пауза, если в канале не нашлось места для запроса (200 мс)
 }
 
 func (c Config) withDefaults() Config {
@@ -61,6 +63,7 @@ func (c Config) withDefaults() Config {
 	def(&c.RetryBase, time.Second)
 	def(&c.RetryMax, 30*time.Second)
 	def(&c.ReconcileDelay, 5*time.Second)
+	def(&c.BusyWait, 200*time.Millisecond)
 	return c
 }
 
@@ -74,6 +77,8 @@ type Worker struct {
 	cfg      Config
 	log      *slog.Logger
 	jitter   func() float64 // [0,1); подменяется в тестах
+	health   *health.Registry
+	budget   *health.RetryBudget
 }
 
 func New(st Store, rt Router, channels []channel.PaymentChannel, clk clock.Clock, cfg Config, log *slog.Logger) *Worker {
@@ -88,6 +93,15 @@ func New(st Store, rt Router, channels []channel.PaymentChannel, clk clock.Clock
 		store: st, router: rt, channels: m, clock: clk,
 		cfg: cfg.withDefaults(), log: log, jitter: rand.Float64,
 	}
+}
+
+// WithHealth подключает защиту каналов: допуск запроса (лимит одновременных
+// запросов и предохранитель) и общий бюджет повторов. Любой из аргументов может
+// быть nil. Роутер стоит создавать с тем же реестром (router.WithHealth), иначе он
+// будет выбирать каналы, в которые воркер не пускает, и платежи станут кружить в очереди.
+func (w *Worker) WithHealth(reg *health.Registry, budget *health.RetryBudget) *Worker {
+	w.health, w.budget = reg, budget
+	return w
 }
 
 // Run запускает cfg.Workers циклов. После отмены ctx воркеры не берут новые платежи,
@@ -161,10 +175,23 @@ func (w *Worker) process(ctx context.Context, p payment.Payment) error {
 		return w.finish(ctx, p, payment.Failed, 0, "канал не зарегистрирован: "+dec.ChannelID)
 	}
 
+	// Место в канале занимается до записи попытки: если его нет, платёж просто
+	// возвращается в очередь, и попытка не тратится.
+	var slot *health.Slot
+	if w.health != nil {
+		var why health.Unavailable
+		if slot, why = w.health.TryBegin(dec.ChannelID); why != "" {
+			return w.finish(ctx, p, payment.Received, w.cfg.BusyWait, "канал "+dec.ChannelID+" недоступен: "+string(why))
+		}
+	}
+
 	// Попытка пишется в БД ДО обращения к каналу: если процесс упадёт посреди
 	// вызова, в БД останется STARTED, и сверщик выяснит исход по ключу попытки.
 	att, err := w.store.StartAttemptWithDecision(prepareCtx, p.ID, dec.ChannelID,
 		&store.RoutingDecision{Strategy: dec.Strategy, Details: dec.Details})
+	if err != nil && slot != nil {
+		slot.Cancel() // запроса в канал не будет
+	}
 	switch {
 	case errors.Is(err, store.ErrLiveAttemptExists):
 		// У платежа уже есть незавершённая попытка — исход неизвестен, повторять нельзя.
@@ -175,8 +202,15 @@ func (w *Worker) process(ctx context.Context, p payment.Payment) error {
 		return w.release(ctx, p, "записать попытку", err)
 	}
 
+	if att.AttemptNo == 1 && w.budget != nil {
+		w.budget.RecordFirst()
+	}
 	cancelPrepare()
+	started := w.clock.Now()
 	res := w.charge(ctx, ch, att, p)
+	if slot != nil {
+		slot.Done(res.Outcome, w.clock.Now().Sub(started))
+	}
 	pl := w.plan(res, att.AttemptNo)
 
 	var next time.Time
@@ -235,6 +269,10 @@ func (w *Worker) plan(res channel.ChargeResult, attemptNo int) plan {
 		if attemptNo >= payment.MaxAttempts {
 			return plan{attemptTo: payment.AttemptChannelError, paymentTo: payment.Failed,
 				reason: "ошибка канала, попытки исчерпаны: " + res.Reason}
+		}
+		if w.budget != nil && !w.budget.TryRetry() {
+			return plan{attemptTo: payment.AttemptChannelError, paymentTo: payment.Failed,
+				reason: "ошибка канала, бюджет повторов исчерпан: " + res.Reason}
 		}
 		return plan{attemptTo: payment.AttemptChannelError, paymentTo: payment.Received,
 			delay: w.retryDelay(attemptNo), reason: "ошибка канала, повтор в другом канале: " + res.Reason}
