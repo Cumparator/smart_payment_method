@@ -16,6 +16,10 @@ import (
 // ErrNoChannel — не осталось каналов, в которые можно отправить платёж.
 var ErrNoChannel = errors.New("router: нет доступных каналов")
 
+// ErrChannelsBusy — подходящие каналы есть, но все перегружены. Это временно:
+// платёж стоит вернуть в очередь, а не завершать неудачей.
+var ErrChannelsBusy = errors.New("router: все подходящие каналы заняты")
+
 // Decision — выбранный канал и объяснение выбора (пишется в routing_decisions).
 type Decision struct {
 	ChannelID   string
@@ -41,6 +45,7 @@ func (s StaticSource) Candidates(context.Context) ([]strategy.Candidate, error) 
 // Health — состояние каналов, которое учитывает роутер. Реализует *health.Registry.
 type Health interface {
 	Snapshot(channelID string) health.Snapshot
+	Unavailable(channelID string) health.Unavailable
 }
 
 var _ Health = (*health.Registry)(nil)
@@ -58,8 +63,9 @@ func New(s strategy.Strategy, src Source) *Router {
 	return &Router{strategy: s, source: src}
 }
 
-// WithHealth подключает статистику каналов: вероятность успеха, задержку и
-// загрузку стратегии берут из неё. Без неё роутер считает статистику нейтральной.
+// WithHealth подключает состояние каналов: вероятность успеха, задержку и загрузку
+// стратегии берут из него, а каналы с открытым предохранителем и перегруженные
+// роутер пропускает. Без него статистика нейтральна и пропусков нет.
 func (r *Router) WithHealth(h Health) *Router {
 	r.health = h
 	return r
@@ -97,14 +103,23 @@ func (r *Router) Choose(ctx context.Context, amount int64, exclude []string) (De
 	}
 	var cands []strategy.Candidate
 	var excluded []excludedInfo
+	busy := false
 	for _, c := range all {
 		if skip[c.ChannelID] {
 			excluded = append(excluded, excludedInfo{ChannelID: c.ChannelID, Reason: "уже использовался для этого платежа"})
 			continue
 		}
+		if why := r.unavailable(c.ChannelID); why != "" {
+			excluded = append(excluded, excludedInfo{ChannelID: c.ChannelID, Reason: string(why)})
+			busy = busy || why == health.Overloaded
+			continue
+		}
 		cands = append(cands, c)
 	}
 	if len(cands) == 0 {
+		if busy {
+			return Decision{}, ErrChannelsBusy
+		}
 		return Decision{}, ErrNoChannel
 	}
 
@@ -142,6 +157,11 @@ func (r *Router) ChoosePayment(ctx context.Context, p payment.Payment, attempts 
 		return Decision{}, err
 	}
 	if len(decision.Ranked) == 0 {
+		for _, e := range decision.Excluded {
+			if e.Reason == ReasonOverloaded {
+				return Decision{}, ErrChannelsBusy
+			}
+		}
 		return Decision{}, ErrNoChannel
 	}
 	excluded := make([]excludedInfo, 0, len(decision.Excluded))
