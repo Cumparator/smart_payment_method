@@ -28,12 +28,17 @@ func (r *Registry) Register(channelID string, defaultLatency time.Duration, maxI
 	s.maxInflight = maxInflight
 }
 
-// Record учитывает завершённую попытку: исход попадает в окно, а время ответа —
-// в сглаженную задержку. Таймаут (UNKNOWN) задержку не меняет: ответа не было.
+// Record учитывает завершённую попытку: исход попадает в окно и в предохранитель
+// канала, а время ответа — в сглаженную задержку. Таймаут (UNKNOWN) задержку не
+// меняет: ответа не было.
 func (r *Registry) Record(channelID string, o channel.ChargeOutcome, latency time.Duration) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.recordLocked(channelID, o, latency)
+	b := r.stats(channelID).breaker
+	r.mu.Unlock()
+	if b != nil {
+		b.Record(o)
+	}
 }
 
 func (r *Registry) recordLocked(channelID string, o channel.ChargeOutcome, latency time.Duration) {
@@ -50,24 +55,11 @@ func (r *Registry) recordLocked(channelID string, o channel.ChargeOutcome, laten
 	s.latencyS += latencyAlpha * (l - s.latencyS)
 }
 
-// Begin отмечает запрос в полёте. Вызвав finish с ответом канала, вызывающий
-// снимает отметку и записывает исход; повторный вызов finish ничего не делает.
+// Begin отмечает запрос в полёте без проверок допуска. Вызвав finish с ответом
+// канала, вызывающий снимает отметку и записывает исход; повторный вызов finish
+// ничего не делает. Для запросов с допуском есть TryBegin.
 func (r *Registry) Begin(channelID string) (finish func(o channel.ChargeOutcome, latency time.Duration)) {
-	r.mu.Lock()
-	r.stats(channelID).inflight++
-	r.mu.Unlock()
-
-	done := false
-	return func(o channel.ChargeOutcome, latency time.Duration) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		if done {
-			return
-		}
-		done = true
-		r.stats(channelID).inflight--
-		r.recordLocked(channelID, o, latency)
-	}
+	return r.reserve(channelID).Done
 }
 
 // Snapshot возвращает текущее состояние канала.

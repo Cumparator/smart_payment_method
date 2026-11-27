@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/Cumparator/smart_payment_method/internal/channel"
+	"github.com/Cumparator/smart_payment_method/internal/clock"
 )
 
 // DefaultWindow — размер окна из статьи arXiv:2308.01028 (SW-UCB, W = 200).
@@ -23,6 +24,7 @@ type channelStats struct {
 	defaultLatencyS float64 // пока замеров нет
 	inflight        int
 	maxInflight     int // 0 — лимит не задан
+	breaker         *Breaker
 }
 
 // Registry — статистика каналов по скользящему окну последних технических
@@ -34,14 +36,41 @@ type Registry struct {
 	head   int // куда писать следующий исход
 	filled int
 	chans  map[string]*channelStats
+
+	clock    clock.Clock
+	breaker  *BreakerConfig // nil — предохранители выключены
+	onChange func(Transition)
+}
+
+// Option настраивает реестр.
+type Option func(*Registry)
+
+// WithBreaker включает предохранитель на каждом канале с заданными порогами.
+func WithBreaker(cfg BreakerConfig) Option {
+	return func(r *Registry) { r.breaker = &cfg }
+}
+
+// WithClock задаёт часы предохранителей; по умолчанию реальные.
+func WithClock(clk clock.Clock) Option {
+	return func(r *Registry) { r.clock = clk }
+}
+
+// OnStateChange вызывает fn при каждой смене состояния любого предохранителя.
+// Вызывается вне блокировок реестра, поэтому fn может обращаться к нему сама.
+func OnStateChange(fn func(Transition)) Option {
+	return func(r *Registry) { r.onChange = fn }
 }
 
 // New создаёт реестр с окном на window исходов; при window <= 0 берётся DefaultWindow.
-func New(window int) *Registry {
+func New(window int, opts ...Option) *Registry {
 	if window <= 0 {
 		window = DefaultWindow
 	}
-	return &Registry{ring: make([]observation, window), chans: make(map[string]*channelStats)}
+	r := &Registry{ring: make([]observation, window), chans: make(map[string]*channelStats), clock: clock.Real{}}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // technical сообщает, входит ли исход в статистику. DECLINED — бизнес-отказ
@@ -60,6 +89,9 @@ func (r *Registry) stats(id string) *channelStats {
 	s, ok := r.chans[id]
 	if !ok {
 		s = &channelStats{}
+		if r.breaker != nil {
+			s.breaker = NewBreaker(id, *r.breaker, r.clock, r.onChange)
+		}
 		r.chans[id] = s
 	}
 	return s

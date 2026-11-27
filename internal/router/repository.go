@@ -12,6 +12,7 @@ import (
 
 	"github.com/Cumparator/smart_payment_method/internal/channel"
 	"github.com/Cumparator/smart_payment_method/internal/clock"
+	"github.com/Cumparator/smart_payment_method/internal/health"
 	"github.com/Cumparator/smart_payment_method/internal/payment"
 	"github.com/Cumparator/smart_payment_method/internal/store"
 	"github.com/Cumparator/smart_payment_method/internal/strategy"
@@ -43,6 +44,8 @@ const (
 	ReasonAboveMaxAmount     ExclusionReason = "above_max_amount"
 	ReasonOutsideSchedule    ExclusionReason = "outside_schedule_utc"
 	ReasonPreviousChannelErr ExclusionReason = "previous_channel_error"
+	ReasonBreakerOpen        ExclusionReason = ExclusionReason(health.BreakerOpen) // предохранитель отключил канал
+	ReasonOverloaded         ExclusionReason = ExclusionReason(health.Overloaded)  // нет места под новые запросы
 )
 
 // Exclusion is an explanation for a filtered channel.
@@ -138,16 +141,44 @@ func (r *Router) selectChannels(ctx context.Context, p payment.Payment, attempts
 			continue
 		}
 
-		candidates = append(candidates, strategy.Candidate{
-			ChannelID: ch.ID,
-			Tariff:    cfg.Tariff,
-			// No health snapshot is wired in at step 1. Keep statistics neutral.
-			LatencyS: float64(ch.AvgLatencyMS) / 1000,
-		})
+		if why := r.unavailable(ch.ID); why != "" {
+			decision.Excluded = append(decision.Excluded, Exclusion{ChannelID: ch.ID, Reason: ExclusionReason(why)})
+			continue
+		}
+
+		candidates = append(candidates, r.candidate(ch, cfg))
 	}
 
 	decision.Ranked = strategy.Rank(r.strategy, p.Amount, candidates)
 	return decision, nil
+}
+
+// unavailable — причина, по которой health не рекомендует канал; пусто, если
+// health не подключён или канал доступен.
+func (r *Router) unavailable(channelID string) health.Unavailable {
+	if r.health == nil {
+		return ""
+	}
+	return r.health.Unavailable(channelID)
+}
+
+// candidate собирает кандидата для стратегий. Без health статистика нейтральна,
+// задержка — из настроек канала; с health берётся измеренная, если замеры есть.
+func (r *Router) candidate(ch store.ChannelRecord, cfg channelConfig) strategy.Candidate {
+	c := strategy.Candidate{
+		ChannelID: ch.ID,
+		Tariff:    cfg.Tariff,
+		LatencyS:  float64(ch.AvgLatencyMS) / 1000,
+	}
+	if r.health == nil {
+		return c
+	}
+	snap := r.health.Snapshot(ch.ID)
+	c.Successes, c.Attempts, c.Load = snap.Successes, snap.Attempts, snap.Load
+	if snap.LatencyS > 0 {
+		c.LatencyS = snap.LatencyS
+	}
+	return c
 }
 
 func decodeChannelConfig(ch store.ChannelRecord) (channelConfig, error) {
