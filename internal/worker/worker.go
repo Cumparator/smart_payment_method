@@ -165,6 +165,9 @@ func (w *Worker) process(ctx context.Context, p payment.Payment) error {
 	switch {
 	case errors.Is(err, store.ErrLiveAttemptExists):
 		return w.finish(ctx, p, payment.Reconciling, w.cfg.ReconcileDelay, "уже есть незавершённая попытка")
+	case errors.Is(err, router.ErrChannelsBusy):
+		// Каналы перегружены временно: платёж ждёт, попытка не тратится.
+		return w.finish(ctx, p, payment.Received, w.cfg.BusyWait, "все подходящие каналы заняты")
 	case errors.Is(err, router.ErrNoChannel):
 		return w.finish(ctx, p, payment.Failed, 0, "нет доступного канала")
 	case err != nil:

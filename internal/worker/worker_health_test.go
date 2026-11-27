@@ -9,7 +9,9 @@ import (
 	"github.com/Cumparator/smart_payment_method/internal/channel"
 	"github.com/Cumparator/smart_payment_method/internal/health"
 	"github.com/Cumparator/smart_payment_method/internal/payment"
+	"github.com/Cumparator/smart_payment_method/internal/router"
 	"github.com/Cumparator/smart_payment_method/internal/store"
+	"github.com/Cumparator/smart_payment_method/internal/strategy"
 )
 
 // guard подключает к воркеру реестр здоровья на часах фикстуры.
@@ -148,5 +150,89 @@ func TestWithoutHealthNothingChanges(t *testing.T) {
 	f.run(t)
 	if p := f.st.pay("p1"); p.State != payment.Received {
 		t.Fatalf("state %s: без health повтор должен работать как раньше", p.State)
+	}
+}
+
+func threeChannels() router.StaticSource {
+	return router.StaticSource{
+		{ChannelID: "cheap", Tariff: channel.Tariff{Fixed: 3, Percent: 0.002}},
+		{ChannelID: "mid", Tariff: channel.Tariff{Fixed: 6, Percent: 0.005}},
+		{ChannelID: "fast", Tariff: channel.Tariff{Fixed: 12, Percent: 0.010}},
+	}
+}
+
+// Роутер с тем же реестром не отправляет платёж в занятый канал, и воркеру
+// не приходится возвращать его в очередь.
+func TestHealthAwareRouterAvoidsBusyChannel(t *testing.T) {
+	f := newFixture(t, &fakeChannel{id: "cheap"}, &fakeChannel{id: "mid"}, &fakeChannel{id: "fast"})
+	reg := f.guard(health.BreakerConfig{}, nil)
+	f.w.router = router.New(strategy.Cheapest{}, threeChannels()).WithHealth(reg)
+	reg.Register("cheap", 0, 1)
+	reg.TryBegin("cheap") // место в cheap занято
+	f.st.add("p1", 10000, f.clk.Now())
+
+	f.run(t)
+	a := f.st.att("p1")
+	if p := f.st.pay("p1"); p.State != payment.Succeeded || len(a) != 1 || a[0].ChannelID != "mid" {
+		t.Fatalf("state %s, попытки %+v: ожидался успех через mid", p.State, a)
+	}
+}
+
+func TestAllChannelsBusyRequeuesPayment(t *testing.T) {
+	f := newFixture(t, &fakeChannel{id: "cheap"}, &fakeChannel{id: "mid"}, &fakeChannel{id: "fast"})
+	reg := f.guard(health.BreakerConfig{}, nil)
+	f.w.router = router.New(strategy.Cheapest{}, threeChannels()).WithHealth(reg)
+	for _, id := range []string{"cheap", "mid", "fast"} {
+		reg.Register(id, 0, 1)
+		reg.TryBegin(id)
+	}
+	f.st.add("p1", 10000, f.clk.Now())
+
+	f.run(t)
+	p := f.st.pay("p1")
+	if p.State != payment.Received || p.AttemptsCount != 0 {
+		t.Fatalf("state %s, попыток %d: при занятых каналах платёж должен ждать, а не падать", p.State, p.AttemptsCount)
+	}
+	if want := f.clk.Now().Add(200 * time.Millisecond); !p.NextRunAt.Equal(want) {
+		t.Fatalf("next_run_at %v, ожидалось %v", p.NextRunAt, want)
+	}
+}
+
+func TestPaymentProceedsWhenChannelsFreeUp(t *testing.T) {
+	f := newFixture(t, &fakeChannel{id: "cheap"}, &fakeChannel{id: "mid"}, &fakeChannel{id: "fast"})
+	reg := f.guard(health.BreakerConfig{}, nil)
+	f.w.router = router.New(strategy.Cheapest{}, threeChannels()).WithHealth(reg)
+	reg.Register("cheap", 0, 1)
+	slot, _ := reg.TryBegin("cheap")
+	reg.Register("mid", 0, 1)
+	reg.TryBegin("mid")
+	reg.Register("fast", 0, 1)
+	reg.TryBegin("fast")
+	f.st.add("p1", 10000, f.clk.Now())
+
+	f.run(t)
+	slot.Done(channel.Approved, 0) // cheap освободился
+	f.clk.Advance(300 * time.Millisecond)
+	if !f.run(t) {
+		t.Fatal("после паузы платёж должен быть взят снова")
+	}
+	if p := f.st.pay("p1"); p.State != payment.Succeeded {
+		t.Fatalf("state %s, ожидался SUCCEEDED", p.State)
+	}
+}
+
+// Каналы без места — не то же самое, что нет каналов: «нет канала» заканчивается неудачей.
+func TestNoChannelStillFailsPayment(t *testing.T) {
+	f := newFixture(t, &fakeChannel{id: "cheap"}, &fakeChannel{id: "mid"}, &fakeChannel{id: "fast"})
+	reg := f.guard(health.BreakerConfig{ConsecutiveFailures: 1}, nil)
+	f.w.router = router.New(strategy.Cheapest{}, threeChannels()).WithHealth(reg)
+	for _, id := range []string{"cheap", "mid", "fast"} {
+		reg.Record(id, channel.ChannelError, 0) // предохранители открыты
+	}
+	f.st.add("p1", 10000, f.clk.Now())
+
+	f.run(t)
+	if p := f.st.pay("p1"); p.State != payment.Failed {
+		t.Fatalf("state %s, ожидался FAILED: все каналы отключены", p.State)
 	}
 }
